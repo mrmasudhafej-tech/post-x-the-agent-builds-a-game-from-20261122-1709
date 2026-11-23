@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lantern Catch — a tiny browser game built from one prompt</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #12081f; overflow: hidden; }
+  #game { display: block; width: 100vw; height: 100vh; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="game" width="1080" height="1920"></canvas>
+<script>
+'use strict';
+// Lantern Catch: move the basket, catch the falling lanterns, don't drop three.
+// Built from one prompt: "Build me a tiny browser game - catch the falling lanterns!"
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const AUTOPLAY = new URLSearchParams(location.search).has('autoplay');
+
+const basket = { w: 260, h: 54, x: W / 2 - 130, y: H - 220, speed: 26 };
+let lanterns = [];
+let score = 0, lives = 3, level = 1, caught = 0, missed = 0;
+let state = 'ready'; // ready | playing | over
+let spawnTimer = 0, elapsed = 0, lastTs = 0;
+let keys = {};
+let combo = 0, comboTimer = 0;
+
+function rand(min, max) { return min + Math.random() * (max - min); }
+
+function spawnLantern() {
+  const r = rand(42, 62);
+  lanterns.push({
+    x: rand(r + 20, W - r - 20),
+    y: -90,
+    r: r,
+    vy: rand(6.5, 9.5) + level * 0.9,
+    sway: rand(0.6, 1.6),
+    phase: rand(0, Math.PI * 2),
+    hue: [38, 46, 320, 190][Math.floor(rand(0, 4))]
+  });
+}
+
+function reset() {
+  lanterns = [];
+  score = 0; lives = 3; level = 1; caught = 0; missed = 0;
+  combo = 0; comboTimer = 0; spawnTimer = 0; elapsed = 0;
+  basket.x = W / 2 - basket.w / 2;
+}
+
+function startGame() {
+  reset();
+  state = 'playing';
+}
+
+function drawLantern(l) {
+  const glow = ctx.createRadialGradient(l.x, l.y, l.r * 0.2, l.x, l.y, l.r * 2.1);
+  glow.addColorStop(0, 'hsla(' + l.hue + ', 95%, 62%, 0.55)');
+  glow.addColorStop(1, 'hsla(' + l.hue + ', 95%, 62%, 0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(l.x, l.y, l.r * 2.1, 0, Math.PI * 2);
+  ctx.fill();
+  // paper lantern body
+  ctx.fillStyle = 'hsl(' + l.hue + ', 92%, 58%)';
+  ctx.beginPath();
+  ctx.ellipse(l.x, l.y, l.r * 0.78, l.r, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = 'hsla(' + l.hue + ', 90%, 78%, 0.9)';
+  ctx.beginPath();
+  ctx.ellipse(l.x, l.y, l.r * 0.45, l.r * 0.8, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // cap + tassel
+  ctx.fillStyle = '#ffd166';
+  ctx.fillRect(l.x - 16, l.y - l.r - 12, 32, 12);
+  ctx.strokeStyle = '#ffd166';
+  ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.moveTo(l.x, l.y + l.r);
+  ctx.lineTo(l.x, l.y + l.r + 26);
+  ctx.stroke();
+}
+
+function drawBasket() {
+  const x = basket.x, y = basket.y;
+  ctx.fillStyle = '#ff5da2';
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x + basket.w, y);
+  ctx.lineTo(x + basket.w - 26, y + basket.h);
+  ctx.lineTo(x + 26, y + basket.h);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = '#ffd166';
+  ctx.fillRect(x - 8, y - 14, basket.w + 16, 18);
+}
+
+function drawHud() {
+  ctx.fillStyle = 'rgba(255,255,255,0.92)';
+  ctx.font = '700 64px system-ui, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('SCORE ' + score, 48, 108);
+  ctx.textAlign = 'right';
+  ctx.fillText('LEVEL ' + level, W - 48, 108);
+  // lives as lantern dots
+  for (let i = 0; i < 3; i++) {
+    ctx.beginPath();
+    ctx.arc(72 + i * 64, 168, 22, 0, Math.PI * 2);
+    ctx.fillStyle = i < lives ? '#ffd166' : 'rgba(255,255,255,0.25)';
+    ctx.fill();
+  }
+  if (combo >= 3 && comboTimer > 0) {
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#7bf1a8';
+    ctx.font = '700 56px system-ui, sans-serif';
+    ctx.fillText('COMBO x' + combo + '!', W / 2, 220);
+  }
+}
+
+function drawOverlay(title, lines) {
+  ctx.fillStyle = 'rgba(10,4,20,0.72)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ffd166';
+  ctx.font = '800 110px system-ui, sans-serif';
+  ctx.fillText(title, W / 2, H / 2 - 120);
+  ctx.fillStyle = 'rgba(255,255,255,0.92)';
+  ctx.font = '500 52px system-ui, sans-serif';
+  lines.forEach((line, i) => ctx.fillText(line, W / 2, H / 2 - 10 + i * 78));
+}
+
+function step(dt) {
+  elapsed += dt;
+  if (comboTimer > 0) comboTimer -= dt;
+  else combo = 0;
+  // move basket
+  if (keys.ArrowLeft || keys.KeyA) basket.x -= basket.speed;
+  if (keys.ArrowRight || keys.KeyD) basket.x += basket.speed;
+  basket.x = Math.max(0, Math.min(W - basket.w, basket.x));
+  // autopilot: chase the lowest lantern
+  if (AUTOPLAY && lanterns.length) {
+    let target = lanterns[0];
+    for (const l of lanterns) if (l.y > target.y) target = l;
+    const cx = basket.x + basket.w / 2;
+    if (target.x < cx - 18) basket.x -= basket.speed * 0.9;
+    if (target.x > cx + 18) basket.x += basket.speed * 0.9;
+    basket.x = Math.max(0, Math.min(W - basket.w, basket.x));
+  }
+  // spawn
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) {
+    spawnLantern();
+    spawnTimer = Math.max(0.32, 0.85 - level * 0.06);
+  }
+  // move + collide
+  for (let i = lanterns.length - 1; i >= 0; i--) {
+    const l = lanterns[i];
+    l.phase += dt * 2;
+    l.y += l.vy;
+    l.x += Math.sin(l.phase) * l.sway;
+    const inBasket = l.y + l.r >= basket.y && l.y + l.r <= basket.y + basket.h + 20 &&
+      l.x > basket.x - 10 && l.x < basket.x + basket.w + 10;
+    if (inBasket) {
+      lanterns.splice(i, 1);
+      caught++;
+      combo++;
+      comboTimer = 2.5;
+      score += 10 + Math.min(combo, 5) * 2;
+      if (caught % 8 === 0) level++;
+    } else if (l.y - l.r > H) {
+      lanterns.splice(i, 1);
+      missed++;
+      lives--;
+      combo = 0;
+      if (lives <= 0) state = 'over';
+    }
+  }
+}
+
+function frame(ts) {
+  const dt = Math.min(0.05, (ts - lastTs) / 1000 || 0.016);
+  lastTs = ts;
+  // night sky
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#1b0b38');
+  sky.addColorStop(0.6, '#2a1245');
+  sky.addColorStop(1, '#12081f');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, H);
+  // stars
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  for (let i = 0; i < 60; i++) {
+    const sx = (i * 173) % W, sy = (i * 311) % 700;
+    ctx.fillRect(sx, sy, 4, 4);
+  }
+  // ground glow
+  ctx.fillStyle = 'rgba(255,93,162,0.14)';
+  ctx.fillRect(0, H - 160, W, 160);
+
+  if (state === 'playing') step(dt);
+  for (const l of lanterns) drawLantern(l);
+  drawBasket();
+  drawHud();
+  if (state === 'ready') {
+    drawOverlay('LANTERN CATCH', ['Catch the falling lanterns!', '', 'Press SPACE or tap to play']);
+  } else if (state === 'over') {
+    drawOverlay('GAME OVER', ['Score: ' + score, 'Lanterns caught: ' + caught, '', 'Press SPACE to play again']);
+  }
+  requestAnimationFrame(frame);
+}
+
+addEventListener('keydown', (e) => {
+  keys[e.code] = true;
+  if (e.code === 'Space') {
+    e.preventDefault();
+    if (state !== 'playing') startGame();
+  }
+});
+addEventListener('keyup', (e) => { keys[e.code] = false; });
+canvas.addEventListener('pointerdown', (e) => {
+  if (state !== 'playing') { startGame(); return; }
+  const rect = canvas.getBoundingClientRect();
+  const px = (e.clientX - rect.left) * (W / rect.width);
+  basket.x = Math.max(0, Math.min(W - basket.w, px - basket.w / 2));
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (state !== 'playing') return;
+  const rect = canvas.getBoundingClientRect();
+  const px = (e.clientX - rect.left) * (W / rect.width);
+  basket.x = Math.max(0, Math.min(W - basket.w, px - basket.w / 2));
+});
+if (AUTOPLAY) startGame();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
